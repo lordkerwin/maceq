@@ -10,7 +10,7 @@ struct MacEQApp: App {
         MenuBarExtra {
             ControlPanel(model: model)
         } label: {
-            Image(systemName: model.engine.isRunning && model.profile.enabled
+            Image(systemName: model.activeCount > 0
                 ? "slider.horizontal.3"
                 : "slider.horizontal.below.square.filled.and.square")
         }
@@ -32,15 +32,16 @@ struct ControlPanel: View {
             header
             Divider()
 
-            if model.targetBundleID == nil {
+            if model.editingBundleID == nil {
                 Text("Pick an app to equalise.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .center)
                     .padding(.vertical, 20)
             } else {
-                if let error = model.engine.lastError {
-                    errorBox(error)
+                if let status = model.status(for: model.editingBundleID),
+                   let error = status.error {
+                    errorBox(error, isPermissionFailure: status.isPermissionFailure)
                 }
                 bands
                 Divider()
@@ -48,18 +49,7 @@ struct ControlPanel: View {
             }
 
             Divider()
-            HStack {
-                Text(model.engine.isRunning
-                    ? "Out: \(model.engine.outputDeviceName) · \(Int(model.engine.sampleRate / 1000)) kHz"
-                    : "Stopped")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("Quit") { model.quit() }
-                    .buttonStyle(.plain)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            statusLine
         }
         .padding(14)
         .frame(width: 340)
@@ -79,12 +69,15 @@ struct ControlPanel: View {
 
                 Divider()
                 Toggle("Show system processes", isOn: $model.showSystemProcesses)
-                if model.targetBundleID != nil {
-                    Button("Stop equalising") { model.select(bundleID: nil) }
+                if let editing = model.editingBundleID {
+                    Button("Forget \(model.targetName)") { model.forget(editing) }
+                }
+                if model.activeCount > 0 {
+                    Button("Turn all off") { model.turnOffAll() }
                 }
             } label: {
                 HStack(spacing: 6) {
-                    appIcon(model.targetBundleID)
+                    appIcon(model.editingBundleID)
                     Text(model.targetName).lineLimit(1)
                 }
             }
@@ -98,24 +91,31 @@ struct ControlPanel: View {
             ))
             .labelsHidden()
             .toggleStyle(.switch)
-            .disabled(model.targetBundleID == nil)
+            .disabled(model.editingBundleID == nil)
+            .help(model.profile.enabled ? "Equalising this app" : "Not equalising this app")
         }
     }
 
+    /// A row is ticked when that app is being equalised, whether or not it is the app
+    /// currently open in the panel.
     private func appRow(_ app: AudioProcess) -> some View {
         Button {
             model.select(bundleID: app.bundleID)
         } label: {
-            // Menu rows render the icon only when it comes through as a Label image,
-            // so hand SwiftUI the NSImage directly rather than styling it here.
+            let title = [
+                model.isEqualised(app.bundleID) ? "✓" : nil,
+                app.name,
+                app.isPlaying ? "♪" : nil,
+            ].compactMap { $0 }.joined(separator: "  ")
+
             if let icon = model.icon(for: app.bundleID) {
                 Label {
-                    Text(app.isPlaying ? "\(app.name)  ♪" : app.name)
+                    Text(title)
                 } icon: {
                     Image(nsImage: icon)
                 }
             } else {
-                Text(app.isPlaying ? "\(app.name)  ♪" : app.name)
+                Text(title)
             }
         }
     }
@@ -192,14 +192,34 @@ struct ControlPanel: View {
         }
     }
 
-    private func errorBox(_ message: String) -> some View {
+    private var statusLine: some View {
+        HStack {
+            Text(statusText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            Button("Quit") { model.quit() }
+                .buttonStyle(.plain)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var statusText: String {
+        guard model.activeCount > 0 else { return "Nothing being equalised" }
+        let apps = model.activeCount == 1 ? "1 app" : "\(model.activeCount) apps"
+        return "\(apps) · \(model.pool.outputDeviceName) · \(Int(model.pool.sampleRate / 1000)) kHz"
+    }
+
+    private func errorBox(_ message: String, isPermissionFailure: Bool) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(message)
                 .font(.caption)
                 .foregroundStyle(.red)
                 .fixedSize(horizontal: false, vertical: true)
 
-            if model.engine.looksLikePermissionFailure {
+            if isPermissionFailure {
                 Text("MacEQ needs Audio Recording permission to read another app's audio.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)

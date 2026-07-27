@@ -24,11 +24,14 @@ Audio Hijack use, now public API. MacEQ:
    real output.
 
 ```
-Slack ──tap (muted)──> [ 5-band biquad EQ ] ──> MacBook Speakers
-Spotify ─────────────────────────────────────> MacBook Speakers
+Slack   ──tap (muted)──> [ EQ: voice curve ] ──┐
+Spotify ──tap (muted)──> [ EQ: warm curve  ] ──┼──> MacBook Speakers
+Firefox ───────────────────────────────────────┘   (untouched)
 ```
 
-Everything else on the machine is untouched.
+Each app gets its own tap, its own aggregate device and its own filter state, so any
+number of apps can be equalised at once with different curves. Everything you haven't
+configured is left completely alone.
 
 ## Build
 
@@ -70,8 +73,14 @@ usual fix for a muddy Slack call — and **Less harsh**, for the opposite proble
        alt="The preset menu open with Slack selected, listing Flat, Voice / calls, Less harsh, Warm, Bright and Bass boost.">
 </p>
 
-Each app gets its own saved curve, and the toggle bypasses processing without tearing
-the audio graph down.
+The dropdown chooses which app you are **editing**, not which app is being equalised.
+Apps currently being equalised are ticked in that list, and they keep working while you
+edit someone else. The switch next to the dropdown turns EQ on or off for the app you
+are looking at: switching it off stops that app's tap entirely, so its audio path goes
+back to completely untouched rather than merely bypassed.
+
+An app only gets a tap while it is actually running. Quit Spotify and its engine stops;
+reopen it and the engine comes back with your curve intact.
 
 ## Design notes
 
@@ -81,6 +90,13 @@ window. Slack calls come out of `com.tinyspeck.slackmacgap.helper`, Discord out 
 shortest known ancestor, so one row in the picker taps every helper behind it. It also
 re-checks every 2 seconds and rebuilds the tap if the app spawns a new audio process —
 which is exactly what starting a huddle does.
+
+**One engine per app.** An earlier version ran a single tap and moved it around, so
+selecting a different app in the dropdown silently stopped equalising the previous one.
+Now `EnginePool` reconciles a desired set (enabled profiles ∩ running apps) against the
+live engines every 2 seconds, starting and stopping taps as apps come and go. Profiles
+live in memory and are mirrored to disk on a 500ms debounce, never read back, which
+removes a bug where re-selecting an app could reload a stale curve over unsaved edits.
 
 **Lock-free parameter updates.** The audio thread never allocates and never blocks.
 Two coefficient blocks are pre-allocated; the UI writes the inactive one and then flips

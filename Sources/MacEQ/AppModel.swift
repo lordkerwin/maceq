@@ -5,51 +5,45 @@ import SwiftUI
 @MainActor
 final class AppModel: ObservableObject {
     @Published private(set) var apps: [AudioProcess] = []
-    @Published private(set) var profile: Profile = .flat
-    @Published var targetBundleID: String?
+    /// In-memory source of truth. Disk is a debounced mirror of this, never the other
+    /// way round, so a save that hasn't landed yet can't be read back stale.
+    @Published private(set) var profiles: [String: Profile] = [:]
+    /// Which app the panel is editing. This no longer decides what is being
+    /// equalised — every enabled profile with a running app gets its own engine.
+    @Published var editingBundleID: String?
     @Published var showSystemProcesses: Bool = UserDefaults.standard.bool(forKey: "showSystemProcesses") {
         didSet { UserDefaults.standard.set(showSystemProcesses, forKey: "showSystemProcesses") }
     }
 
-    /// Real apps, plus whatever is currently selected so the target never vanishes
-    /// from its own picker.
-    var userApps: [AudioProcess] {
-        apps.filter { $0.isUserApp || $0.bundleID == targetBundleID }
-    }
-
-    var systemProcesses: [AudioProcess] {
-        apps.filter { !$0.isUserApp && $0.bundleID != targetBundleID }
-    }
-
-    func icon(for bundleID: String?) -> NSImage? {
-        guard let bundleID else { return nil }
-        return AppInfoCache.info(for: bundleID, fallbackPID: 0).icon
-    }
-
-    let engine = TapEngine()
+    let pool = EnginePool()
 
     private var refreshTimer: Timer?
     private var saveWorkItem: DispatchWorkItem?
-    private var engineObserver: AnyCancellable?
+    private var poolObserver: AnyCancellable?
 
     init() {
-        // Re-push the curve whenever the graph is rebuilt: coefficients are
-        // sample-rate dependent and the rate follows the output device.
-        engine.onGraphChanged = { [weak self] in
-            guard let self else { return }
-            self.engine.apply(self.profile)
-        }
-        engineObserver = engine.objectWillChange.sink { [weak self] _ in
+        profiles = ProfileStore.loadAll()
+        editingBundleID = ProfileStore.lastTarget
+
+        poolObserver = pool.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
 
         refresh()
-        if let last = ProfileStore.lastTarget {
-            select(bundleID: last, autoStart: true)
-        }
 
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.flushSaves()
+                self?.pool.stopAll()
+            }
         }
     }
 
@@ -57,57 +51,97 @@ final class AppModel: ObservableObject {
         refreshTimer?.invalidate()
     }
 
-    // MARK: - App selection
+    // MARK: - Current selection
 
-    func refresh() {
-        apps = AudioProcessList.current()
-        engine.reconcileMembers()
-    }
-
-    func select(bundleID: String?, autoStart: Bool = true) {
-        targetBundleID = bundleID
-        ProfileStore.lastTarget = bundleID
-
-        guard let bundleID else {
-            engine.stop()
-            profile = .flat
-            return
-        }
-
-        profile = ProfileStore.load(for: bundleID)
-        if autoStart {
-            engine.start(bundleID: bundleID)
-        }
-        engine.apply(profile)
+    var profile: Profile {
+        editingBundleID.flatMap { profiles[$0] } ?? .flat
     }
 
     var targetName: String {
-        guard let targetBundleID else { return "Select app…" }
-        return apps.first { $0.bundleID == targetBundleID }?.name
-            ?? AppInfoCache.info(for: targetBundleID, fallbackPID: 0).name
+        guard let editingBundleID else { return "Select app…" }
+        return apps.first { $0.bundleID == editingBundleID }?.name
+            ?? AppInfoCache.info(for: editingBundleID, fallbackPID: 0).name
+    }
+
+    /// Apps with an engine actually running right now.
+    var activeCount: Int { pool.runningCount }
+
+    func isEqualised(_ bundleID: String) -> Bool {
+        profiles[bundleID]?.enabled ?? false
+    }
+
+    func status(for bundleID: String?) -> EnginePool.Status? {
+        guard let bundleID else { return nil }
+        return pool.status[bundleID]
+    }
+
+    // MARK: - App list
+
+    /// Real apps, plus anything already configured or selected, so a configured app
+    /// never disappears from its own picker.
+    var userApps: [AudioProcess] {
+        apps.filter { $0.isUserApp || $0.bundleID == editingBundleID || isEqualised($0.bundleID) }
+    }
+
+    var systemProcesses: [AudioProcess] {
+        apps.filter { !$0.isUserApp && $0.bundleID != editingBundleID && !isEqualised($0.bundleID) }
+    }
+
+    func icon(for bundleID: String?) -> NSImage? {
+        guard let bundleID else { return nil }
+        return AppInfoCache.info(for: bundleID, fallbackPID: 0).icon
+    }
+
+    func refresh() {
+        apps = AudioProcessList.current()
+        syncEngines()
+    }
+
+    /// An app gets an engine when it is enabled *and* currently running. Tapping an
+    /// app that isn't there would just build a graph with nothing on the other end.
+    private func syncEngines() {
+        let available = Set(apps.map(\.bundleID))
+        let desired = Set(profiles.filter { $0.value.enabled }.keys).intersection(available)
+        let snapshot = profiles
+        pool.reconcile(desired: desired) { snapshot[$0] ?? .flat }
+    }
+
+    // MARK: - Selection
+
+    func select(bundleID: String?) {
+        editingBundleID = bundleID
+        ProfileStore.lastTarget = bundleID
+
+        guard let bundleID else { return }
+        if profiles[bundleID] == nil {
+            profiles[bundleID] = .flat
+            scheduleSave()
+            syncEngines()
+        }
     }
 
     // MARK: - Curve edits
 
     func setGain(band index: Int, to value: Double) {
-        guard profile.bands.indices.contains(index) else { return }
-        profile.bands[index].gainDB = value
-        commit()
+        mutate { profile in
+            guard profile.bands.indices.contains(index) else { return }
+            profile.bands[index].gainDB = value
+        }
     }
 
     func setPreamp(_ value: Double) {
-        profile.preampDB = value
-        commit()
+        mutate { $0.preampDB = value }
     }
 
     func setEnabled(_ value: Bool) {
-        profile.enabled = value
-        commit()
+        mutate { $0.enabled = value }
+        // Disabling stops the engine outright rather than bypassing it, so the app's
+        // audio path goes back to completely untouched.
+        syncEngines()
     }
 
     func apply(preset: Preset) {
-        profile = preset.applied(to: profile)
-        commit()
+        mutate { $0 = preset.applied(to: $0) }
     }
 
     /// Flatten every band and the preamp, leaving the on/off state alone.
@@ -116,20 +150,49 @@ final class AppModel: ObservableObject {
         apply(preset: flat)
     }
 
+    func turnOffAll() {
+        for key in profiles.keys { profiles[key]?.enabled = false }
+        scheduleSave()
+        syncEngines()
+    }
+
+    func forget(_ bundleID: String) {
+        profiles[bundleID] = nil
+        if editingBundleID == bundleID {
+            editingBundleID = nil
+            ProfileStore.lastTarget = nil
+        }
+        scheduleSave()
+        syncEngines()
+    }
+
     var matchingPreset: Preset? {
         Preset.all.first { $0.matches(profile) }
     }
 
-    /// Push to the audio thread immediately, write to disk lazily.
-    private func commit() {
-        engine.apply(profile)
+    private func mutate(_ change: (inout Profile) -> Void) {
+        guard let bundleID = editingBundleID else { return }
+        var updated = profiles[bundleID] ?? .flat
+        change(&updated)
+        profiles[bundleID] = updated
+        pool.apply(updated, to: bundleID)
+        scheduleSave()
+    }
 
+    // MARK: - Persistence
+
+    private func scheduleSave() {
         saveWorkItem?.cancel()
-        guard let bundleID = targetBundleID else { return }
-        let snapshot = profile
-        let work = DispatchWorkItem { ProfileStore.save(snapshot, for: bundleID) }
+        let snapshot = profiles
+        let work = DispatchWorkItem { ProfileStore.saveAll(snapshot) }
         saveWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    private func flushSaves() {
+        saveWorkItem?.cancel()
+        saveWorkItem = nil
+        ProfileStore.saveAll(profiles)
     }
 
     // MARK: - Misc
@@ -145,7 +208,8 @@ final class AppModel: ObservableObject {
     }
 
     func quit() {
-        engine.stop()
+        flushSaves()
+        pool.stopAll()
         NSApplication.shared.terminate(nil)
     }
 }

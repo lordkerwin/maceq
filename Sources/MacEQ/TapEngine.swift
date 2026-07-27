@@ -1,5 +1,8 @@
 import CoreAudio
 import Foundation
+import OSLog
+
+let engineLog = Logger(subsystem: "dev.seankerwin.maceq", category: "engine")
 
 /// Everything the audio thread is allowed to touch. Immutable after construction,
 /// so the IOProc block can capture it without synchronising against the UI.
@@ -92,62 +95,83 @@ private final class RenderContext: @unchecked Sendable {
     }
 }
 
+/// One app's audio graph: a tap on that app, a private aggregate device pairing the
+/// tap with the real output, and an IOProc filtering between them.
+///
+/// Engines are independent, so several apps can be equalised at once. `EnginePool`
+/// owns their lifetimes; nothing here tears itself down on `deinit`, because the
+/// CoreAudio teardown has to happen on the main actor.
 @MainActor
-final class TapEngine: ObservableObject {
-    @Published private(set) var isRunning = false
-    @Published private(set) var lastError: String?
-    @Published private(set) var outputDeviceName = ""
-    @Published private(set) var sampleRate: Double = 48_000
-
+final class TapEngine {
+    let bundleID: String
     let kernel = EQKernel(bandCount: Profile.bandCount)
 
-    /// Fired when the graph is rebuilt, so the caller can push its curve back in
-    /// (coefficients depend on the sample rate, which can change with the device).
-    var onGraphChanged: (() -> Void)?
+    private(set) var isRunning = false
+    private(set) var lastError: String?
+    private(set) var outputDeviceName = ""
+    private(set) var sampleRate: Double = 48_000
 
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var ioProcID: AudioDeviceIOProcID?
-    private var targetBundleID: String?
-    private var deviceListener: AudioObjectPropertyListenerBlock?
     private var trackedMembers: Set<AudioObjectID> = []
+    private var currentProfile: Profile = .flat
+
+    init(bundleID: String) {
+        self.bundleID = bundleID
+    }
 
     // MARK: - Lifecycle
 
-    func start(bundleID: String) {
+    @discardableResult
+    func start() -> Bool {
         stop()
-        targetBundleID = bundleID
-
         do {
-            try buildGraph(bundleID: bundleID)
+            try buildGraph()
             isRunning = true
             lastError = nil
-            installDeviceListener()
-            onGraphChanged?()
+            // Coefficients depend on the sample rate, which follows the output
+            // device, so always recompute after the graph is (re)built.
+            pushToKernel()
+            engineLog.info("started \(self.bundleID, privacy: .public) on \(self.outputDeviceName, privacy: .public) @ \(self.sampleRate, privacy: .public) Hz")
+            return true
         } catch {
             teardownGraph()
             isRunning = false
             lastError = error.localizedDescription
+            engineLog.error("failed \(self.bundleID, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            return false
         }
     }
 
     func stop() {
-        removeDeviceListener()
         teardownGraph()
-        targetBundleID = nil
         isRunning = false
     }
 
     /// True when the failure looks like a missing Audio Recording permission rather
     /// than a genuine audio problem.
     var looksLikePermissionFailure: Bool {
-        guard let lastError else { return false }
-        return lastError.contains("AudioHardwareCreateProcessTap")
+        lastError?.contains("AudioHardwareCreateProcessTap") ?? false
+    }
+
+    // MARK: - Curve
+
+    func apply(_ profile: Profile) {
+        currentProfile = profile
+        pushToKernel()
+    }
+
+    private func pushToKernel() {
+        kernel.update(bands: currentProfile.bands,
+                      sampleRate: sampleRate,
+                      preampDB: currentProfile.preampDB,
+                      bypass: !currentProfile.enabled)
     }
 
     // MARK: - Graph
 
-    private func buildGraph(bundleID: String) throws {
+    private func buildGraph() throws {
         let outputDevice = try AudioDevices.defaultOutput()
         let outputUID = try AudioDevices.uid(of: outputDevice)
         outputDeviceName = AudioDevices.name(of: outputDevice)
@@ -157,6 +181,7 @@ final class TapEngine: ObservableObject {
         //    actually reading — if this process dies, the app goes back to normal.
         let members = AudioProcessList.members(ofRoot: bundleID)
         trackedMembers = Set(members.objectIDs)
+
         let description = CATapDescription(stereoMixdownOfProcesses: members.objectIDs)
         description.name = "MacEQ – \(bundleID)"
         description.isPrivate = true
@@ -178,9 +203,10 @@ final class TapEngine: ObservableObject {
 
         // 2. A private aggregate that owns both the tap (input) and the real output
         //    device. Drift compensation on the tap is what keeps the two clocks married.
+        //    Several aggregates may name the same output device; the HAL mixes them.
         let aggregateUID = "dev.seankerwin.maceq.\(UUID().uuidString)"
         let aggregateDescription: [String: Any] = [
-            kAudioAggregateDeviceNameKey: "MacEQ",
+            kAudioAggregateDeviceNameKey: "MacEQ (\(bundleID))",
             kAudioAggregateDeviceUIDKey: aggregateUID,
             kAudioAggregateDeviceMainSubDeviceKey: outputUID,
             kAudioAggregateDeviceIsPrivateKey: true,
@@ -232,49 +258,102 @@ final class TapEngine: ObservableObject {
             AudioHardwareDestroyProcessTap(tapID)
             tapID = AudioObjectID(kAudioObjectUnknown)
         }
+        trackedMembers = []
     }
 
-    /// Rebuild if the target app has spun up an audio process we aren't tapping.
+    // MARK: - Membership
+
+    /// Rebuild if the app has spun up an audio process we aren't tapping.
     ///
     /// Starting a Slack huddle spawns a fresh renderer helper; without this its audio
-    /// would bypass the EQ entirely. Costs a few ms of silence at the moment a call
-    /// starts, which is cheaper than a call with no EQ on it.
-    func reconcileMembers() {
-        guard isRunning, let bundleID = targetBundleID else { return }
+    /// would bypass the EQ entirely.
+    func reconcileMembersIfNeeded() {
+        guard isRunning else { return }
         let current = Set(AudioProcessList.members(ofRoot: bundleID).objectIDs)
         guard !current.isEmpty, !current.isSubset(of: trackedMembers) else { return }
-        start(bundleID: bundleID)
+        start()
+    }
+}
+
+/// Owns one `TapEngine` per app being equalised.
+@MainActor
+final class EnginePool: ObservableObject {
+    struct Status {
+        let isRunning: Bool
+        let error: String?
+        let isPermissionFailure: Bool
+    }
+
+    @Published private(set) var status: [String: Status] = [:]
+    @Published private(set) var outputDeviceName = ""
+    @Published private(set) var sampleRate: Double = 48_000
+
+    private var engines: [String: TapEngine] = [:]
+    private var deviceListener: AudioObjectPropertyListenerBlock?
+
+    var runningCount: Int { engines.values.filter(\.isRunning).count }
+
+    init() {
+        installDeviceListener()
+    }
+
+    /// Start engines for `desired`, stop every engine not in it.
+    func reconcile(desired: Set<String>, profile: (String) -> Profile) {
+        for (bundleID, engine) in engines where !desired.contains(bundleID) {
+            engine.stop()
+            engines[bundleID] = nil
+        }
+
+        for bundleID in desired where engines[bundleID] == nil {
+            let engine = TapEngine(bundleID: bundleID)
+            engine.apply(profile(bundleID))
+            engine.start()
+            engines[bundleID] = engine
+        }
+
+        for engine in engines.values {
+            engine.reconcileMembersIfNeeded()
+        }
+
+        publishStatus()
+    }
+
+    func apply(_ profile: Profile, to bundleID: String) {
+        engines[bundleID]?.apply(profile)
+    }
+
+    func stopAll() {
+        for engine in engines.values { engine.stop() }
+        engines.removeAll()
+        publishStatus()
+    }
+
+    private func publishStatus() {
+        status = engines.mapValues {
+            Status(isRunning: $0.isRunning,
+                   error: $0.lastError,
+                   isPermissionFailure: $0.looksLikePermissionFailure)
+        }
+        if let running = engines.values.first(where: \.isRunning) {
+            outputDeviceName = running.outputDeviceName
+            sampleRate = running.sampleRate
+        }
     }
 
     // MARK: - Output device changes
 
-    /// Rebuild when the user switches output (headphones in/out), otherwise the
-    /// aggregate keeps pointing at a device nobody is listening to.
+    /// One listener for the whole pool: when the user switches output (headphones in
+    /// or out), every engine's aggregate is pointing at the wrong device.
     private func installDeviceListener() {
         var address = AudioObjectID.system.address(kAudioHardwarePropertyDefaultOutputDevice)
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             Task { @MainActor in
-                guard let self, let bundleID = self.targetBundleID else { return }
-                self.start(bundleID: bundleID)
+                guard let self else { return }
+                for engine in self.engines.values { engine.start() }
+                self.publishStatus()
             }
         }
         deviceListener = block
         AudioObjectAddPropertyListenerBlock(AudioObjectID.system, &address, DispatchQueue.main, block)
-    }
-
-    private func removeDeviceListener() {
-        guard let deviceListener else { return }
-        var address = AudioObjectID.system.address(kAudioHardwarePropertyDefaultOutputDevice)
-        AudioObjectRemovePropertyListenerBlock(AudioObjectID.system, &address, DispatchQueue.main, deviceListener)
-        self.deviceListener = nil
-    }
-
-    // MARK: - Curve
-
-    func apply(_ profile: Profile) {
-        kernel.update(bands: profile.bands,
-                      sampleRate: sampleRate,
-                      preampDB: profile.preampDB,
-                      bypass: !profile.enabled)
     }
 }

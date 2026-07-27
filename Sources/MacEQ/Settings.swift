@@ -91,25 +91,16 @@ enum ProfileStore {
     private static let profilesKey = "profiles"
     private static let targetKey = "targetBundleID"
 
-    static func load(for bundleID: String) -> Profile {
+    static func loadAll() -> [String: Profile] {
         guard let data = UserDefaults.standard.data(forKey: profilesKey),
-              let all = try? JSONDecoder().decode([String: Profile].self, from: data),
-              let profile = all[bundleID]
-        else { return .flat }
-        return profile.normalised
+              let all = try? JSONDecoder().decode([String: Profile].self, from: data)
+        else { return [:] }
+        return all.mapValues(\.normalised)
     }
 
-    static func save(_ profile: Profile, for bundleID: String) {
-        let defaults = UserDefaults.standard
-        var all: [String: Profile] = [:]
-        if let data = defaults.data(forKey: profilesKey),
-           let decoded = try? JSONDecoder().decode([String: Profile].self, from: data) {
-            all = decoded
-        }
-        all[bundleID] = profile
-        if let data = try? JSONEncoder().encode(all) {
-            defaults.set(data, forKey: profilesKey)
-        }
+    static func saveAll(_ profiles: [String: Profile]) {
+        guard let data = try? JSONEncoder().encode(profiles) else { return }
+        UserDefaults.standard.set(data, forKey: profilesKey)
     }
 
     static var lastTarget: String? {
