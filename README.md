@@ -5,6 +5,11 @@ Built for fixing boomy or harsh voices on Slack calls.
 
 No virtual audio driver, no changing your system output device, no paid software.
 
+<p align="center">
+  <img src="docs/screenshot-panel.png" width="420"
+       alt="MacEQ menu bar panel with Spotify selected, showing five frequency sliders and a preamp, the Warm preset applied, and MacBook Pro Speakers at 48 kHz as the output.">
+</p>
+
 ## How it works
 
 macOS 14.4+ exposes **Core Audio process taps** — the same mechanism SoundSource and
@@ -56,8 +61,14 @@ Apps currently making noise are marked `▸` and sorted to the top.
 | Treble | ±12 dB | 12 kHz high shelf |
 | Preamp | -12/+6 dB | Pull down when boosting, or boosts will clip |
 
-Double-click any slider to reset it to 0. Presets include **Voice / calls**, which cuts
-rumble and mud and lifts presence — the usual fix for a muddy Slack call.
+Double-click any slider to reset it to 0, or **Reset all** to flatten everything.
+Presets include **Voice / calls**, which cuts rumble and mud and lifts presence — the
+usual fix for a muddy Slack call — and **Less harsh**, for the opposite problem.
+
+<p align="center">
+  <img src="docs/screenshot-presets.png" width="420"
+       alt="The preset menu open with Slack selected, listing Flat, Voice / calls, Less harsh, Warm, Bright and Bass boost.">
+</p>
 
 Each app gets its own saved curve, and the toggle bypasses processing without tearing
 the audio graph down.
