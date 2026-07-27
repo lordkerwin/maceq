@@ -87,9 +87,13 @@ reopen it and the engine comes back with your curve intact.
 **Helper processes.** Electron apps do not play audio from the process that owns the
 window. Slack calls come out of `com.tinyspeck.slackmacgap.helper`, Discord out of
 `com.hnc.Discord.helper.Renderer`. MacEQ folds every `parent.*` bundle ID onto its
-shortest known ancestor, so one row in the picker taps every helper behind it. It also
-re-checks every 2 seconds and rebuilds the tap if the app spawns a new audio process —
-which is exactly what starting a huddle does.
+shortest known ancestor, so one row in the picker taps every helper behind it.
+
+The tap is registered with those bundle IDs and `processRestoreEnabled`, so CoreAudio
+re-binds new processes of a known bundle ID by itself. MacEQ only rebuilds the graph
+when a bundle ID it has *never* registered turns up. An earlier version watched raw
+process object IDs instead, which meant apps that churn short-lived helpers rebuilt the
+graph every few seconds, and every rebuild is an audible dropout.
 
 **One engine per app.** An earlier version ran a single tap and moved it around, so
 selecting a different app in the dropdown silently stopped equalising the previous one.

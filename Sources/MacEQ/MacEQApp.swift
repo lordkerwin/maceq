@@ -69,8 +69,15 @@ struct ControlPanel: View {
 
                 Divider()
                 Toggle("Show system processes", isOn: $model.showSystemProcesses)
-                if let editing = model.editingBundleID {
-                    Button("Forget \(model.targetName)") { model.forget(editing) }
+
+                // Forgetting from here rather than from the selected app, because
+                // selecting an app is what creates its profile in the first place.
+                if !model.configuredApps.isEmpty {
+                    Menu("Discard saved settings for…") {
+                        ForEach(model.configuredApps) { app in
+                            Button(app.name) { model.forget(app.bundleID) }
+                        }
+                    }
                 }
                 if model.activeCount > 0 {
                     Button("Turn all off") { model.turnOffAll() }

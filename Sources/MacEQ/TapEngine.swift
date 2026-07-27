@@ -115,6 +115,7 @@ final class TapEngine {
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var ioProcID: AudioDeviceIOProcID?
     private var trackedMembers: Set<AudioObjectID> = []
+    private var registeredBundleIDs: Set<String> = []
     private var currentProfile: Profile = .flat
 
     init(bundleID: String) {
@@ -145,8 +146,12 @@ final class TapEngine {
     }
 
     func stop() {
+        let wasRunning = isRunning
         teardownGraph()
         isRunning = false
+        if wasRunning {
+            engineLog.info("stopped \(self.bundleID, privacy: .public)")
+        }
     }
 
     /// True when the failure looks like a missing Audio Recording permission rather
@@ -181,6 +186,7 @@ final class TapEngine {
         //    actually reading — if this process dies, the app goes back to normal.
         let members = AudioProcessList.members(ofRoot: bundleID)
         trackedMembers = Set(members.objectIDs)
+        registeredBundleIDs = Set(members.bundleIDs)
 
         let description = CATapDescription(stereoMixdownOfProcesses: members.objectIDs)
         description.name = "MacEQ – \(bundleID)"
@@ -263,14 +269,30 @@ final class TapEngine {
 
     // MARK: - Membership
 
-    /// Rebuild if the app has spun up an audio process we aren't tapping.
+    /// Rebuild if the app has spun up an audio process the tap cannot reach.
     ///
     /// Starting a Slack huddle spawns a fresh renderer helper; without this its audio
-    /// would bypass the EQ entirely.
+    /// would bypass the EQ entirely. Rebuilding is a real audible dropout though, so
+    /// it has to be rare.
+    ///
+    /// On macOS 26 the tap is registered with the app's bundle IDs and process
+    /// restore, so CoreAudio re-binds new processes of an *already registered* bundle
+    /// ID by itself. Only a bundle ID we have never registered needs a rebuild.
+    /// Watching raw process object IDs instead means apps that churn short-lived
+    /// helpers (Linear does this) rebuild the graph every few seconds for nothing.
     func reconcileMembersIfNeeded() {
         guard isRunning else { return }
-        let current = Set(AudioProcessList.members(ofRoot: bundleID).objectIDs)
-        guard !current.isEmpty, !current.isSubset(of: trackedMembers) else { return }
+        let members = AudioProcessList.members(ofRoot: bundleID)
+        guard !members.objectIDs.isEmpty else { return }
+
+        if #available(macOS 26.0, *) {
+            let unseen = Set(members.bundleIDs).subtracting(registeredBundleIDs)
+            guard !unseen.isEmpty else { return }
+            engineLog.info("rebuilding \(self.bundleID, privacy: .public): new bundle IDs \(unseen.sorted().joined(separator: ", "), privacy: .public)")
+        } else {
+            guard !Set(members.objectIDs).isSubset(of: trackedMembers) else { return }
+        }
+
         start()
     }
 }

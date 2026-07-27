@@ -70,6 +70,24 @@ final class AppModel: ObservableObject {
         profiles[bundleID]?.enabled ?? false
     }
 
+    func isConfigured(_ bundleID: String) -> Bool {
+        profiles[bundleID] != nil
+    }
+
+    struct ConfiguredApp: Identifiable {
+        let bundleID: String
+        let name: String
+        var id: String { bundleID }
+    }
+
+    /// Apps with a saved curve, running or not, so they can be forgotten without
+    /// selecting them first (selecting would re-create the profile).
+    var configuredApps: [ConfiguredApp] {
+        profiles.keys
+            .map { ConfiguredApp(bundleID: $0, name: AppInfoCache.info(for: $0, fallbackPID: 0).name) }
+            .sorted { $0.name.lowercased() < $1.name.lowercased() }
+    }
+
     func status(for bundleID: String?) -> EnginePool.Status? {
         guard let bundleID else { return nil }
         return pool.status[bundleID]
