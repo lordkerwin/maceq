@@ -1,0 +1,5 @@
+.build/
+.swiftpm/
+MacEQ.app/
+*.xcuserstate
+.DS_Store
